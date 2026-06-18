@@ -183,7 +183,7 @@ End of voice or word-level segments are not indicated in this format.
 
 The entry point `simulstreaming_canary_server.py` has the same model options as `simulstreaming_canary.py`, plus:
 - `--host` and `--port` of the TCP connection, 
-- `--warmup-file`: the warmup audio file is decoded by the Whisper backend after the model is loaded because without that, processing of the very the first input chunk may take longer.
+- `--warmup-file`: the warmup audio file is decoded by the Whisper backend after the model is loaded because without that, processing of the very first input chunk may take longer.
 
 See the help message (`-h` option).
 
