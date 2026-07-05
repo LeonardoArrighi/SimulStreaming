@@ -29,7 +29,6 @@ options:
   -h, --help            show this help message and exit
   -l {DEBUG,INFO,WARNING,ERROR,CRITICAL}, --log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}
                         Set the log level
-  --logdir LOGDIR       Directory to save audio segments and generated texts for debugging.
   --out-txt             Output formatted as not as jsonl but simple space-separated text: beg, end, text
 
 WhisperStreaming processor arguments (shared for simulation from file and for the server):
@@ -43,7 +42,7 @@ WhisperStreaming processor arguments (shared for simulation from file and for th
 
 Canary arguments:
   --model_path MODEL_PATH
-                        The file path to the Whisper .nemo model. If not present on the filesystem, the model is downloaded automatically.
+                        The file path to the Canary .nemo model. If not present on the filesystem, the model is downloaded automatically.
   --beams BEAMS, -b BEAMS
                         Number of beams for beam search decoding. If 1, GreedyDecoder is used.
   --decoder DECODER     Override automatic selection of beam or greedy decoder. If beams > 1 and greedy: invalid.
@@ -202,3 +201,32 @@ arecord -f S16_LE -c1 -r 16000 -t raw -D default | nc localhost 43001
 
 **Windows/Mac**: `ffmpeg` may substitute `arecord`. Or use the solutions proposed in Whisper-Streaming pull requests [#111](https://github.com/ufal/whisper_streaming/pull/111) and [#123](https://github.com/ufal/whisper_streaming/pull/123).
 
+
+### Usage: Docker simulstream
+
+As a part of IWSLT campaign, a [simulstream](https://github.com/hlt-mt/simulstream) processor was also implemented and packaged into an [image](https://hub.docker.com/r/azizortega/canary-alignatt). 
+
+#### Run the server
+
+Parameters are set via environment variables at runtime.
+
+```bash
+docker run --rm --gpus=all -p 8080:8080 \
+  -e CHUNK_SIZE=<chunk> \
+  -e FRAME_THRESHOLD=<frame> \
+  canary-alignatt
+```
+
+#### Running inference
+
+Once the container is up, run inference:
+
+```bash
+simulstream_inference \
+  --speech-processor-config http_proxy_processor.yaml \
+  --wav-list-file wavs.txt \
+  --src-lang <src> --tgt-lang <tgt> \
+  --metrics-log-file output.jsonl
+```
+
+**NOTE**: first consult the simulstream documentation to install all the required dependencies.
