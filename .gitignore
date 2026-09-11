@@ -1,0 +1,16 @@
+# Model weights
+*.pt
+*.bin
+*.safetensors
+*.pth
+*.ckpt
+
+# Python cache & build
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+env/
+venv/
