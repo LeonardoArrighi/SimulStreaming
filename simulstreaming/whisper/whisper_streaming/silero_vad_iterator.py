@@ -1,4 +1,131 @@
+import os
+import warnings
+from pathlib import Path
+import numpy as np
 import torch
+
+def is_onnx_available() -> bool:
+    try:
+        import onnxruntime
+        return True
+    except ImportError:
+        return False
+
+class OnnxSession:
+    """Sessione condivisa ONNX per il modello Silero VAD (stateless)."""
+    def __init__(self, path: str, force_onnx_cpu: bool = True):
+        import onnxruntime
+        opts = onnxruntime.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 1
+        if force_onnx_cpu and 'CPUExecutionProvider' in onnxruntime.get_available_providers():
+            self.session = onnxruntime.InferenceSession(path, providers=['CPUExecutionProvider'], sess_options=opts)
+        else:
+            self.session = onnxruntime.InferenceSession(path, sess_options=opts)
+        self.path = path
+        self.sample_rates = [8000, 16000]
+
+class OnnxWrapper:
+    """Wrapper ONNX Runtime per Silero VAD con tracciamento di stato interno."""
+    def __init__(self, session: OnnxSession):
+        self._shared_session = session
+        self.sample_rates = session.sample_rates
+        self.reset_states()
+
+    @property
+    def session(self):
+        return self._shared_session.session
+
+    def reset_states(self, batch_size: int = 1):
+        self._state = np.zeros((2, batch_size, 128), dtype=np.float32)
+        self._context = np.zeros((batch_size, 0), dtype=np.float32)
+        self._last_sr = 0
+        self._last_batch_size = 0
+
+    def __call__(self, x, sr: int):
+        if hasattr(x, "numpy"):
+            x = x.numpy()
+        elif hasattr(x, "cpu"):
+            x = x.cpu().numpy()
+        elif not isinstance(x, np.ndarray):
+            x = np.array(x, dtype=np.float32)
+
+        if x.ndim == 1:
+            x = np.expand_dims(x, axis=0)
+
+        num_samples = 512 if sr == 16000 else 256
+        if x.shape[-1] != num_samples:
+            raise ValueError(f"Dimensione chunk errata: {x.shape[-1]} (richiesti 512 campioni a 16kHz)")
+
+        batch_size = x.shape[0]
+        context_size = 64 if sr == 16000 else 32
+
+        if not self._last_batch_size or self._last_batch_size != batch_size or (self._last_sr and self._last_sr != sr):
+            self.reset_states(batch_size)
+
+        if self._context.shape[1] == 0:
+            self._context = np.zeros((batch_size, context_size), dtype=np.float32)
+
+        x_with_context = np.concatenate([self._context, x], axis=1)
+        ort_inputs = {
+            'input': x_with_context,
+            'state': self._state,
+            'sr': np.array(sr, dtype=np.int64)
+        }
+        out, new_state = self.session.run(None, ort_inputs)
+        self._state = new_state
+        self._context = x_with_context[:, -context_size:]
+        self._last_sr = sr
+        self._last_batch_size = batch_size
+        return out[0, 0]
+
+
+def load_silero_vad(model_path: str = None, force_onnx_cpu: bool = True):
+    """Carica Silero VAD usando ONNX Runtime (preferito) o torch.hub come fallback."""
+    # 1. Cerca il file ONNX
+    candidate_paths = []
+    if model_path:
+        candidate_paths.append(Path(model_path))
+    env_path = os.environ.get("SILERO_VAD_ONNX_PATH")
+    if env_path:
+        candidate_paths.append(Path(env_path))
+
+    here = Path(__file__).resolve().parent
+    candidate_paths.append(here / "silero_vad_models" / "silero_vad.onnx")
+    # Percorso in WhisperLiveKit se presente nel workspace RSI
+    try:
+        rsi_root = here.parents[3]
+        candidate_paths.append(rsi_root / "WhisperLiveKit" / "whisperlivekit" / "silero_vad_models" / "silero_vad.onnx")
+        candidate_paths.append(rsi_root / "SimulTranscription" / "silero_vad_models" / "silero_vad.onnx")
+    except Exception:
+        pass
+
+    chosen_onnx = None
+    for p in candidate_paths:
+        if p.is_file():
+            chosen_onnx = p
+            break
+
+    if is_onnx_available() and chosen_onnx is not None:
+        try:
+            sess = OnnxSession(str(chosen_onnx), force_onnx_cpu=force_onnx_cpu)
+            wrapper = OnnxWrapper(sess)
+            import logging
+            logging.getLogger(__name__).info(f"[VAC] Silero VAD ONNX caricato da: {chosen_onnx}")
+            return wrapper
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"[VAC] Errore caricamento ONNX ({e}), fallback su torch.hub")
+
+    # Fallback standard su torch.hub
+    import logging
+    logging.getLogger(__name__).info("[VAC] Caricamento Silero VAD via torch.hub...")
+    model, _ = torch.hub.load(
+        repo_or_dir='snakers4/silero-vad',
+        model='silero_vad'
+    )
+    return model
+
 
 # This is copied from silero-vad's vad_utils.py:
 # https://github.com/snakers4/silero-vad/blob/94811cbe1207ec24bc0f5370b895364b8934936f/src/silero_vad/utils_vad.py#L398C1-L489C20
