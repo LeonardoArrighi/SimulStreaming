@@ -1,5 +1,5 @@
 from .base import OnlineProcessorInterface
-from .silero_vad_iterator import FixedVADIterator
+from .silero_vad_iterator import FixedVADIterator, load_silero_vad
 import numpy as np
 
 import logging
@@ -20,12 +20,8 @@ class VACOnlineASRProcessor(OnlineProcessorInterface):
 
         self.min_buffered_frames = int(min_buffered_length * self.SAMPLING_RATE)
 
-        # VAC:
-        import torch
-        model, _ = torch.hub.load(
-            repo_or_dir='snakers4/silero-vad',
-            model='silero_vad'
-        )
+        # VAC (Silero VAD via ONNX o fallback su torch.hub):
+        model = load_silero_vad()
         self.vac = FixedVADIterator(model)  # we use the default options there: 500ms silence, 100ms padding, etc.
 
         self.init()
