@@ -29,3 +29,5 @@ class AlignAttConfig(SimulWhisperConfig):
     audio_max_len: float = 30.0
     cif_ckpt_path: str = ""
     never_fire: bool = False
+    encoder_backend: str = "whisper"
+    compute_type: str = "int8_float16"

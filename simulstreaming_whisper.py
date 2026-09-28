@@ -2,8 +2,10 @@ from simulstreaming.whisper.whisper_streaming.base import OnlineProcessorInterfa
 import argparse
 
 import sys
+import os
 import logging
 import torch
+import numpy as np
 
 from simulstreaming.whisper.simul_whisper.config import AlignAttConfig
 from simulstreaming.whisper.simul_whisper.simul_whisper import PaddedAlignAttWhisper
@@ -11,9 +13,20 @@ from simulstreaming.whisper.simul_whisper.simul_whisper import PaddedAlignAttWhi
 logger = logging.getLogger(__name__)
 
 def simulwhisper_args(parser):
-    group = parser.add_argument_group('Whisper arguments')
-    group.add_argument('--model_path', type=str, default='./large-v3.pt', 
-                        help='The file path to the Whisper .pt model. If not present on the filesystem, the model is downloaded automatically.')
+    group = parser.add_argument_group('Whisper / Faster-Whisper arguments')
+    group.add_argument('--backend', type=str, default='simulstreaming',
+                        choices=['simulstreaming', 'faster-whisper', 'ctranslate2'],
+                        help='ASR backend: "simulstreaming" (policy AlignAtt) oppure "faster-whisper" / "ctranslate2" (full CTranslate2 con quantizzazione INT8).')
+    group.add_argument('--encoder-backend', type=str, default='faster-whisper',
+                        choices=['faster-whisper', 'whisper', 'ctranslate2'],
+                        help='Backend encoder per SimulStreaming: "faster-whisper" (accelerazione CTranslate2 INT8/FP16) '
+                             'oppure "whisper" (PyTorch vanilla). Default: faster-whisper.')
+    group.add_argument('--compute-type', '--compute_type', type=str, default='int8_float16',
+                        choices=['int8_float16', 'int8', 'int8_bfloat16', 'float16', 'float32', 'auto'],
+                        help='Tipo di quantizzazione per Faster-Whisper / CTranslate2 (default: int8_float16). '
+                             'Dimezza la memoria VRAM e velocizza i calcoli di 2x-4x.')
+    group.add_argument('--model_path', type=str, default='./medium.pt', 
+                        help='The file path to the Whisper .pt model or model size for faster-whisper (e.g. medium, large-v3).')
     group.add_argument("--beams","-b", type=int, default=1, help="Number of beams for beam search decoding. If 1, GreedyDecoder is used.")
     group.add_argument("--decoder",type=str, default=None, help="Override automatic selection of beam or greedy decoder. "
                         "If beams > 1 and greedy: invalid.")
@@ -51,6 +64,21 @@ def simulwhisper_args(parser):
 
 def simul_asr_factory(args):
     logger.setLevel(args.log_level)
+
+    # 1. Se richiesto backend full faster-whisper (CTranslate2)
+    backend = getattr(args, "backend", "simulstreaming")
+    if backend in ("faster-whisper", "ctranslate2"):
+        asr = FasterWhisperASR(
+            language=args.lan,
+            model_path=args.model_path,
+            compute_type=getattr(args, "compute_type", "int8_float16"),
+            task=args.task,
+            init_prompt=getattr(args, "init_prompt", None) or getattr(args, "static_init_prompt", None),
+            beam_size=args.beams,
+        )
+        return asr, FasterWhisperOnline(asr, min_chunk_size=args.min_chunk_size)
+
+    # 2. Altrimenti SimulStreaming (AlignAtt policy con supporto encoder Faster-Whisper INT8)
     decoder = args.decoder
     if args.beams > 1:
         if decoder == "greedy":
@@ -67,7 +95,8 @@ def simul_asr_factory(args):
         # else: it is greedy or beam, that's ok 
     
     a = { v:getattr(args, v) for v in ["model_path", "cif_ckpt_path", "frame_threshold", "audio_min_len", "audio_max_len", "beams", "task",
-                                       "never_fire", 'init_prompt', 'static_init_prompt', 'max_context_tokens', "logdir"
+                                       "never_fire", 'init_prompt', 'static_init_prompt', 'max_context_tokens', "logdir",
+                                       "encoder_backend", "compute_type"
                                        ]}
     a["language"] = args.lan
     a["segment_length"] = args.min_chunk_size
@@ -86,7 +115,8 @@ class SimulWhisperASR(ASRBase):
     sep = " "
 
     def __init__(self, language, model_path, cif_ckpt_path, frame_threshold, audio_max_len, audio_min_len, segment_length, beams, task, 
-                 decoder_type, never_fire, init_prompt, static_init_prompt, max_context_tokens, logdir):
+                 decoder_type, never_fire, init_prompt, static_init_prompt, max_context_tokens, logdir,
+                 encoder_backend="faster-whisper", compute_type="int8_float16"):
         cfg = AlignAttConfig(
             model_path=model_path, 
             segment_length=segment_length,
@@ -103,8 +133,10 @@ class SimulWhisperASR(ASRBase):
             max_context_tokens=max_context_tokens,
             static_init_prompt=static_init_prompt,
             logdir=logdir,
+            encoder_backend=encoder_backend,
+            compute_type=compute_type,
         )
-        logger.info(f"Language: {language}")
+        logger.info(f"Language: {language} | Encoder: {encoder_backend} ({compute_type})")
         self.model = PaddedAlignAttWhisper(cfg)
 
     def transcribe(self, audio, init_prompt=""):
@@ -252,7 +284,120 @@ class SimulWhisperOnline(OnlineProcessorInterface):
         self.is_last = False
         self.model.refresh_segment(complete=True)
         return o
-    
+
+
+class FasterWhisperASR(ASRBase):
+    """Backend nativo Faster-Whisper (CTranslate2) con supporto INT8."""
+    sep = ""
+
+    def __init__(self, language, model_path, compute_type="int8_float16", task="transcribe",
+                 init_prompt=None, beam_size=1):
+        from faster_whisper import WhisperModel
+
+        self.language = language if language != "auto" else None
+        self.task = task
+        self.init_prompt = init_prompt
+        self.beam_size = beam_size
+        self.compute_type = compute_type
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_name = os.path.basename(model_path).replace(".pt", "") if model_path.endswith(".pt") else model_path
+        download_root = os.path.dirname(os.path.abspath(model_path)) if model_path.endswith(".pt") and os.path.isdir(os.path.dirname(os.path.abspath(model_path))) else None
+
+        logger.info(f"[faster-whisper] Caricamento modello completo CTranslate2: '{model_name}' (device={device}, compute_type={compute_type})")
+        self.model = WhisperModel(
+            model_name,
+            device=device,
+            compute_type=compute_type,
+            download_root=download_root,
+        )
+        logger.info(f"[faster-whisper] Backend CTranslate2 (INT8) caricato con successo!")
+
+    def warmup(self, audio, init_prompt=""):
+        if isinstance(audio, torch.Tensor):
+            audio = audio.numpy()
+        self.model.transcribe(audio, language=self.language, beam_size=1)
+
+    def set_translate_task(self):
+        self.task = "translate"
+
+
+class FasterWhisperOnline(OnlineProcessorInterface):
+    """Processore online per Faster-Whisper (CTranslate2) con quantizzazione INT8."""
+
+    def __init__(self, asr: FasterWhisperASR, min_chunk_size=0.5):
+        self.asr = asr
+        self.model = asr.model
+        self.min_chunk_size = min_chunk_size
+        self.init()
+
+    def init(self, offset=None):
+        self.audio_buffer = np.array([], dtype=np.float32)
+        self.offset = offset if offset is not None else 0.0
+        self.last_ts = self.offset
+        self.is_last = False
+
+    def insert_audio_chunk(self, audio):
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().cpu().numpy()
+        self.audio_buffer = np.append(self.audio_buffer, audio)
+
+    def process_iter(self):
+        buf_len_sec = len(self.audio_buffer) / self.SAMPLING_RATE
+        if buf_len_sec < self.min_chunk_size and not self.is_last:
+            return {}
+
+        segments, _ = self.model.transcribe(
+            self.audio_buffer,
+            language=self.asr.language,
+            task=self.asr.task,
+            initial_prompt=self.asr.init_prompt,
+            beam_size=self.asr.beam_size,
+            word_timestamps=True,
+            condition_on_previous_text=False,
+        )
+
+        words = []
+        full_text = []
+        for s in segments:
+            full_text.append(s.text)
+            if s.words:
+                for w in s.words:
+                    words.append({
+                        "start": float(self.offset + w.start),
+                        "end": float(self.offset + w.end),
+                        "text": w.word
+                    })
+
+        text = "".join(full_text).strip()
+        if not text:
+            return {}
+
+        start_ts = float(words[0]["start"]) if words else float(self.offset)
+        end_ts = float(words[-1]["end"]) if words else float(self.offset + buf_len_sec)
+
+        # Se il buffer supera 20 secondi, conserva gli ultimi 5 secondi per non saturare la memoria
+        if buf_len_sec > 20.0 and words:
+            trim_sec = max(0.0, buf_len_sec - 5.0)
+            trim_samples = int(trim_sec * self.SAMPLING_RATE)
+            self.audio_buffer = self.audio_buffer[trim_samples:]
+            self.offset += trim_sec
+
+        return {
+            "start": start_ts,
+            "end": end_ts,
+            "text": text,
+            "words": words,
+            "is_final": self.is_last
+        }
+
+    def finish(self):
+        self.is_last = True
+        res = self.process_iter()
+        self.is_last = False
+        self.init()
+        return res
+
 
 if __name__ == "__main__":
 

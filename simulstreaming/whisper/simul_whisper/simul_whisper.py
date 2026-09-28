@@ -44,6 +44,32 @@ class PaddedAlignAttWhisper:
 
         logger.info(f"Model dimensions: {self.model.dims}")
 
+        # Inizializzazione encoder CTranslate2 / Faster-Whisper (quantizzazione INT8 / FP16)
+        self.fw_encoder = None
+        self.fw_feature_extractor = None
+        encoder_backend = getattr(cfg, "encoder_backend", "whisper")
+        if encoder_backend in ("faster-whisper", "ctranslate2"):
+            try:
+                from faster_whisper import WhisperModel
+                from faster_whisper.feature_extractor import FeatureExtractor
+
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                compute_type = getattr(cfg, "compute_type", "int8_float16")
+                logger.info(f"[faster-whisper] Caricamento encoder CTranslate2: '{model_name}' (device={device}, compute_type={compute_type})")
+                self.fw_encoder = WhisperModel(
+                    model_name,
+                    device=device,
+                    compute_type=compute_type,
+                    download_root=model_path if os.path.isdir(model_path) else None,
+                )
+                self.fw_feature_extractor = FeatureExtractor(
+                    feature_size=self.model.dims.n_mels,
+                )
+                logger.info(f"[faster-whisper] Encoder CTranslate2 ({compute_type}) attivo: VRAM ridotta del 50%, velocità 2x-4x!")
+            except Exception as e:
+                logger.warning(f"[faster-whisper] Impossibile caricare Faster-Whisper encoder ({e}). Fallback su PyTorch vanilla.")
+                self.fw_encoder = None
+
         self.decode_options = DecodingOptions(
             language = cfg.language, 
             without_timestamps = True,
@@ -350,17 +376,38 @@ class PaddedAlignAttWhisper:
 
 
         
-        # mel + padding to 30s
-        mel_padded = log_mel_spectrogram(input_segments, n_mels=self.model.dims.n_mels, padding=N_SAMPLES, 
-                                            device=self.model.device).unsqueeze(0)
-        # trim to 3000
-        mel = pad_or_trim(mel_padded, N_FRAMES)
+        if getattr(self, "fw_encoder", None) is not None:
+            from faster_whisper.audio import pad_or_trim as fw_pad_or_trim
 
-        # the len of actual audio
-        content_mel_len = int((mel_padded.shape[2] - mel.shape[2])/2)
+            audio_length_seconds = len(input_segments) / 16000
+            content_mel_len = int(audio_length_seconds * 100) // 2
 
-        # encode
-        encoder_feature = self.model.encoder(mel)
+            audio_np = input_segments.detach().cpu().numpy() if isinstance(input_segments, torch.Tensor) else np.asarray(input_segments)
+            mel_padded_2 = self.fw_feature_extractor(
+                waveform=audio_np, padding=N_SAMPLES,
+            )[None, :]
+            mel = fw_pad_or_trim(mel_padded_2, N_FRAMES, axis=-1)
+
+            encoder_feature_ctranslate = self.fw_encoder.encode(mel)
+            encoder_feature = torch.as_tensor(
+                encoder_feature_ctranslate,
+                device=self.model.device,
+            )
+            decoder_dtype = next(self.model.decoder.parameters()).dtype
+            if encoder_feature.dtype != decoder_dtype:
+                encoder_feature = encoder_feature.to(decoder_dtype)
+        else:
+            # mel + padding to 30s
+            mel_padded = log_mel_spectrogram(input_segments, n_mels=self.model.dims.n_mels, padding=N_SAMPLES, 
+                                                device=self.model.device).unsqueeze(0)
+            # trim to 3000
+            mel = pad_or_trim(mel_padded, N_FRAMES)
+
+            # the len of actual audio
+            content_mel_len = int((mel_padded.shape[2] - mel.shape[2])/2)
+
+            # encode
+            encoder_feature = self.model.encoder(mel)
 
 #        logger.debug(f"Encoder feature shape: {encoder_feature.shape}")
 #        if mel.shape[-2:] != (self.model.dims.n_audio_ctx, self.model.dims.n_audio_state):
@@ -386,7 +433,7 @@ class PaddedAlignAttWhisper:
         ####################### Decoding loop
         logger.info("Decoding loop starts\n")
 
-        sum_logprobs = torch.zeros(self.cfg.beam_size, device=mel.device)
+        sum_logprobs = torch.zeros(self.cfg.beam_size, device=self.model.device)
         completed = False
 
         attn_of_alignment_heads = None
