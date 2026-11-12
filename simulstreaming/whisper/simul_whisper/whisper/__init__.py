@@ -138,7 +138,9 @@ def load_model(
         alignment_heads = _ALIGNMENT_HEADS[name]
     elif os.path.isfile(name):
         checkpoint_file = open(name, "rb").read() if in_memory else name
-        alignment_heads = None
+        # alignment_heads = None
+        model_name = os.path.splitext(os.path.basename(name))[0]
+        alignment_heads = _ALIGNMENT_HEADS.get(model_name, _ALIGNMENT_HEADS.get(name, None))
     else:
         raise RuntimeError(
             f"Model {name} not found; available models = {available_models()}"
