@@ -270,11 +270,12 @@ class PaddedAlignAttWhisper:
         if segment is not None:
             self.segments.append(segment)
 
-        removed_len = 0
+        total_removed = 0       # returned: the caller moves the timestamp offset by all the audio dropped
         # len of audio is bigger than buffer_len. Going to remove the first segment
         segments_len = self.segments_len()
         while len(self.segments) > 1 and segments_len > self.cfg.audio_max_len:
             removed_len = self.segments[0].shape[0] / 16000
+            total_removed += removed_len
             segments_len -= removed_len
             self.last_attend_frame -= int(TOKENS_PER_SECOND*removed_len)
             self.segments = self.segments[1:]
@@ -282,7 +283,7 @@ class PaddedAlignAttWhisper:
             if len(self.tokens) > 1:
                 self.context.append_token_ids(self.tokens[1][0,:])
                 self.tokens = [self.initial_tokens] + self.tokens[2:]
-        return removed_len
+        return total_removed
 
     def _clean_cache(self):
         '''clean the cache that stores the attention matrices and kv_cache.
